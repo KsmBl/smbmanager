@@ -1,0 +1,452 @@
+#!/usr/bin/env python3
+"""Privileged backend for SMB Manager.
+
+Every operation that needs root goes through this script, which is started
+with ``pkexec``.  It deliberately has no GUI dependencies and only speaks a
+small, fixed command vocabulary so the attack surface stays tiny.
+
+Commands:
+    status                      print a JSON status report
+    install                     install the samba package with pacman
+    upgrade                     full system upgrade, then install samba
+    pending                     list samba packages waiting to be upgraded
+    service <action>            start|stop|restart|enable|disable samba
+    apply                       read a share file on stdin and install it
+    passwd <user>               read a password on stdin, set it in Samba
+    deluser <user>              remove a user from the Samba password db
+    mkdir <path> <user>         create a share folder owned by <user>
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import pwd
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+SMB_CONF = "/etc/samba/smb.conf"
+SHARE_FILE = "/etc/samba/smbmanager.conf"
+INCLUDE_LINE = f"   include = {SHARE_FILE}"
+SERVICES = ("smb.service", "nmb.service")
+SAFE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+DEFAULT_SMB_CONF = f"""\
+# /etc/samba/smb.conf - created by SMB Manager
+#
+# Only the [global] section belongs here; the shares managed by SMB Manager
+# live in {SHARE_FILE} and are pulled in by the include at the end.
+
+[global]
+   workgroup = WORKGROUP
+   server string = %h
+   server role = standalone server
+   map to guest = Bad User
+   security = user
+   passdb backend = tdbsam
+
+   log file = /var/log/samba/%m.log
+   max log size = 1000
+   logging = file
+
+   # Modern clients only; SMB1 stays off.
+   server min protocol = SMB2_10
+   client min protocol = SMB2_10
+
+   # Announce the server to Windows Explorer.
+   disable netbios = no
+   dns proxy = no
+
+{INCLUDE_LINE}
+"""
+
+_USER_RE = re.compile(r"^[a-z_][a-z0-9_-]*\$?$")
+_FORBIDDEN_PREFIXES = (
+    "/bin", "/boot", "/dev", "/etc", "/lib", "/lib64", "/proc",
+    "/run", "/sbin", "/sys", "/usr", "/var/lib", "/var/run",
+)
+
+
+def die(message: str, code: int = 1):
+    print(message, file=sys.stderr)
+    sys.exit(code)
+
+
+def tool(name: str) -> str:
+    found = shutil.which(name, path=SAFE_PATH)
+    if not found:
+        die(f"Required program '{name}' was not found. Is samba installed?")
+    return found
+
+
+def run(argv, **kwargs) -> subprocess.CompletedProcess:
+    env = dict(os.environ, PATH=SAFE_PATH, LC_ALL="C")
+    return subprocess.run(
+        argv, env=env, capture_output=True, text=True, **kwargs
+    )
+
+
+def check_user(name: str) -> str:
+    if not _USER_RE.match(name or ""):
+        die(f"Refusing to work with the user name '{name}'.")
+    try:
+        pwd.getpwnam(name)
+    except KeyError:
+        die(f"'{name}' is not a user on this system.")
+    return name
+
+
+def samba_installed() -> bool:
+    return shutil.which("smbd", path=SAFE_PATH) is not None
+
+
+# Packages that ship the private libraries smbd links against.  If any of them
+# lags behind the samba package the dynamic linker refuses to start smbd - the
+# classic Arch partial upgrade.
+SAMBA_FAMILY = ("samba", "smbclient", "libwbclient", "ldb", "talloc",
+                "tevent", "tdb")
+
+PARTIAL_UPGRADE_HINT = (
+    "Samba is installed but cannot run: its libraries belong to a different "
+    "Samba version.\n"
+    "This is a partial upgrade. Fix it with a full system update:\n"
+    "\n    sudo pacman -Syu\n"
+)
+
+
+def loader_broken(stderr: str) -> bool:
+    """True when the message is the dynamic linker refusing to start a binary."""
+    return (
+        "PRIVATE_SAMBA' not found" in stderr
+        or "error while loading shared libraries" in stderr
+        or "symbol lookup error" in stderr
+    )
+
+
+def _first_lines(text: str, limit: int = 3) -> str:
+    """The linker repeats itself once per library; a few lines are enough."""
+    lines = [line for line in text.strip().splitlines() if line.strip()]
+    extra = len(lines) - limit
+    kept = "\n".join(lines[:limit])
+    return kept + (f"\n... and {extra} more lines like this" if extra > 0 else "")
+
+
+def samba_runs() -> tuple:
+    """Check that smbd can actually be executed.  Returns (ok, detail)."""
+    smbd = shutil.which("smbd", path=SAFE_PATH)
+    if not smbd:
+        return False, "smbd is not installed"
+    result = run([smbd, "--version"])
+    output = (result.stderr or "") + (result.stdout or "")
+    if result.returncode != 0 or loader_broken(output):
+        return False, _first_lines(output)
+    return True, result.stdout.strip()
+
+
+def pending_family_updates() -> list:
+    """Samba related packages that have a newer version in the sync database."""
+    pacman = shutil.which("pacman", path=SAFE_PATH)
+    if not pacman:
+        return []
+    result = run([pacman, "-Qu"])
+    pending = []
+    for line in result.stdout.splitlines():
+        name = line.split(" ", 1)[0]
+        if name in SAMBA_FAMILY:
+            pending.append(line.strip())
+    return pending
+
+
+# ---------------------------------------------------------------- commands
+
+
+def cmd_status():
+    users = []
+    if samba_installed() and os.path.exists("/var/lib/samba/private/passdb.tdb"):
+        result = run([tool("pdbedit"), "-L"])
+        for line in result.stdout.splitlines():
+            if ":" in line:
+                users.append(line.split(":", 1)[0])
+    healthy, detail = samba_runs()
+    state = {
+        "installed": samba_installed(),
+        "healthy": healthy,
+        "health_detail": detail,
+        "smb_conf": os.path.exists(SMB_CONF),
+        "include_ok": include_present(),
+        "samba_users": users,
+    }
+    for unit in SERVICES:
+        key = unit.split(".")[0]
+        state[f"{key}_active"] = unit_state(["is-active", unit])
+        state[f"{key}_enabled"] = unit_state(["is-enabled", unit])
+    print(json.dumps(state))
+
+
+def unit_state(args) -> str:
+    systemctl = shutil.which("systemctl", path=SAFE_PATH)
+    if not systemctl:
+        return "unknown"
+    return run([systemctl] + args).stdout.strip() or "unknown"
+
+
+def cmd_install():
+    _install(upgrade=False)
+
+
+def cmd_upgrade():
+    _install(upgrade=True)
+
+
+def cmd_pending():
+    print(json.dumps(pending_family_updates()))
+
+
+def _install(upgrade: bool):
+    if samba_installed() and not upgrade:
+        ok, detail = samba_runs()
+        if ok:
+            print("samba is already installed")
+            return
+        die(PARTIAL_UPGRADE_HINT + "\n" + detail)
+    pacman = shutil.which("pacman", path=SAFE_PATH)
+    if not pacman:
+        die("pacman was not found - this tool targets Arch Linux.")
+
+    if not upgrade:
+        # Installing samba while its companion packages are outdated links the
+        # new binaries against old private libraries and breaks smbd.
+        pending = pending_family_updates()
+        if pending:
+            die(
+                "Refusing to install: these Samba packages are outdated and "
+                "would not match the version being installed:\n  "
+                + "\n  ".join(pending)
+                + "\n\nUpdate the system first (sudo pacman -Syu), or let "
+                "SMB Manager do it for you."
+            )
+
+    argv = [pacman, "-Syu", "--needed", "--noconfirm", "samba"] if upgrade \
+        else [pacman, "-S", "--needed", "--noconfirm", "samba"]
+    print(
+        "Updating the system and installing samba..." if upgrade
+        else "Installing the samba package, this can take a moment...",
+        flush=True,
+    )
+    result = subprocess.run(
+        argv, env=dict(os.environ, PATH=SAFE_PATH, LC_ALL="C")
+    )
+    if result.returncode != 0:
+        die(
+            "pacman could not install samba.\n"
+            "If it complained about missing or outdated packages, refresh the "
+            "system first with:  sudo pacman -Syu"
+        )
+
+    # pacman exiting 0 is not proof that the daemon can run.
+    ok, detail = samba_runs()
+    if not ok:
+        die(PARTIAL_UPGRADE_HINT + "\n" + detail)
+    bootstrap()
+    print("samba installed")
+
+
+def include_present() -> bool:
+    try:
+        with open(SMB_CONF, "r", encoding="utf-8") as fh:
+            for line in fh:
+                stripped = line.strip()
+                if stripped.startswith("#") or stripped.startswith(";"):
+                    continue
+                if stripped.replace(" ", "").lower() == f"include={SHARE_FILE}":
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def bootstrap():
+    """Make sure smb.conf exists and includes our share file."""
+    os.makedirs("/etc/samba", exist_ok=True)
+    if not os.path.exists(SMB_CONF):
+        write_root_file(SMB_CONF, DEFAULT_SMB_CONF)
+    elif not include_present():
+        shutil.copy2(SMB_CONF, SMB_CONF + ".smbmanager.bak")
+        with open(SMB_CONF, "r", encoding="utf-8") as fh:
+            text = fh.read()
+        text = text.rstrip("\n") + (
+            "\n\n# Shares managed by SMB Manager\n" + INCLUDE_LINE + "\n"
+        )
+        write_root_file(SMB_CONF, text)
+    if not os.path.exists(SHARE_FILE):
+        write_root_file(SHARE_FILE, "# Managed by SMB Manager\n")
+    os.makedirs("/var/log/samba", exist_ok=True)
+
+
+def write_root_file(path: str, text: str):
+    directory = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".smbmanager-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.chmod(tmp, 0o644)
+        os.chown(tmp, 0, 0)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def cmd_apply():
+    if not samba_installed():
+        die("samba is not installed yet.")
+    content = sys.stdin.read()
+    if len(content) > 512 * 1024:
+        die("The share configuration is implausibly large, refusing to write.")
+    bootstrap()
+    validate(content)
+    write_root_file(SHARE_FILE, content)
+    reload_if_running()
+    print("configuration applied")
+
+
+def validate(content: str):
+    """Run the candidate configuration through testparm before installing."""
+    testparm = shutil.which("testparm", path=SAFE_PATH)
+    if not testparm:
+        return
+    with tempfile.TemporaryDirectory(prefix="smbmanager-check-") as tmpdir:
+        shares = os.path.join(tmpdir, "shares.conf")
+        with open(shares, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        with open(SMB_CONF, "r", encoding="utf-8") as fh:
+            main = fh.read()
+        main = main.replace(SHARE_FILE, shares)
+        candidate = os.path.join(tmpdir, "smb.conf")
+        with open(candidate, "w", encoding="utf-8") as fh:
+            fh.write(main)
+        result = run([testparm, "-s", "--suppress-prompt", candidate])
+        if result.returncode != 0:
+            if loader_broken(result.stderr):
+                # testparm itself is broken; the health check reports why.
+                return
+            die("Samba rejected the configuration:\n" + result.stderr.strip())
+
+
+def reload_if_running():
+    systemctl = shutil.which("systemctl", path=SAFE_PATH)
+    if systemctl and run([systemctl, "is-active", "smb.service"]).returncode == 0:
+        run([systemctl, "reload", "smb.service"])
+
+
+def cmd_service(action: str):
+    if action not in {"start", "stop", "restart", "enable", "disable"}:
+        die(f"Unknown service action '{action}'.")
+    if not samba_installed():
+        die("samba is not installed yet.")
+    if action in {"start", "restart", "enable"}:
+        bootstrap()
+        ok, detail = samba_runs()
+        if not ok:
+            die(PARTIAL_UPGRADE_HINT + "\n" + detail)
+    systemctl = tool("systemctl")
+    failures = []
+    for unit in SERVICES:
+        if run([systemctl, "cat", unit]).returncode != 0:
+            continue  # unit not shipped on this system, skip it
+        result = run([systemctl, action, unit])
+        if result.returncode != 0:
+            failures.append(f"{unit}: {result.stderr.strip() or 'failed'}")
+    if failures:
+        die(
+            "systemctl " + action + " failed:\n" + "\n".join(failures)
+            + journal_tail()
+        )
+    print(f"{action} ok")
+
+
+def journal_tail(unit: str = "smb.service", lines: int = 8) -> str:
+    """The last log lines of the unit, so the GUI can show a real reason."""
+    journalctl = shutil.which("journalctl", path=SAFE_PATH)
+    if not journalctl:
+        return ""
+    result = run([journalctl, "-u", unit, "-n", str(lines), "--no-pager"])
+    text = "\n".join(
+        line for line in result.stdout.splitlines()
+        if not line.startswith("-- ")
+    ).strip()
+    return f"\n\nLast log lines of {unit}:\n{text}" if text else ""
+
+
+def cmd_passwd(user: str):
+    check_user(user)
+    if not samba_installed():
+        die("samba is not installed yet.")
+    password = sys.stdin.readline().rstrip("\n")
+    if not password:
+        die("No password was supplied.")
+    bootstrap()
+    smbpasswd = tool("smbpasswd")
+    result = run(
+        [smbpasswd, "-a", "-s", user], input=f"{password}\n{password}\n"
+    )
+    if result.returncode != 0:
+        die("smbpasswd failed:\n" + (result.stderr or result.stdout).strip())
+    run([smbpasswd, "-e", "-s", user])
+    print(f"password set for {user}")
+
+
+def cmd_deluser(user: str):
+    check_user(user)
+    result = run([tool("smbpasswd"), "-x", user])
+    if result.returncode != 0:
+        die("smbpasswd failed:\n" + (result.stderr or result.stdout).strip())
+    print(f"{user} removed from the Samba user database")
+
+
+def cmd_mkdir(path: str, user: str):
+    entry = pwd.getpwnam(check_user(user))
+    if not os.path.isabs(path) or ".." in path.split("/"):
+        die("Refusing to create a non absolute path.")
+    real = os.path.realpath(path)
+    for prefix in _FORBIDDEN_PREFIXES:
+        if real == prefix or real.startswith(prefix + "/"):
+            die(f"Refusing to create a share folder inside {prefix}.")
+    if not os.path.isdir(real):
+        os.makedirs(real, mode=0o2775, exist_ok=True)
+        os.chown(real, entry.pw_uid, entry.pw_gid)
+    print(f"folder ready: {real}")
+
+
+def main(argv):
+    if os.geteuid() != 0:
+        die("This helper has to run as root (it is started via pkexec).")
+    if not argv:
+        die(__doc__ or "missing command")
+    command, args = argv[0], argv[1:]
+    table = {
+        "status": (cmd_status, 0),
+        "install": (cmd_install, 0),
+        "upgrade": (cmd_upgrade, 0),
+        "pending": (cmd_pending, 0),
+        "bootstrap": (lambda: (bootstrap(), print("ready"))[1], 0),
+        "apply": (cmd_apply, 0),
+        "service": (cmd_service, 1),
+        "passwd": (cmd_passwd, 1),
+        "deluser": (cmd_deluser, 1),
+        "mkdir": (cmd_mkdir, 2),
+    }
+    if command not in table:
+        die(f"Unknown command '{command}'.")
+    func, argc = table[command]
+    if len(args) != argc:
+        die(f"'{command}' expects {argc} argument(s).")
+    func(*args)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
