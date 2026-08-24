@@ -34,6 +34,10 @@ def helper_path() -> str:
 
 
 def current_user() -> str:
+    """The human behind the session, even when we were started with sudo."""
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and sudo_user != "root":
+        return sudo_user
     try:
         return getpass.getuser()
     except Exception:
@@ -185,7 +189,8 @@ def run_privileged(args, stdin_data: str | None = None, timeout: int = 600):
     helper = helper_path()
     if not os.path.exists(helper):
         raise PrivilegedError(f"The helper script is missing: {helper}")
-    argv = ["pkexec", helper, *args]
+    # Already root (``sudo smbmanager ...``)?  Then pkexec is only in the way.
+    argv = [helper, *args] if os.geteuid() == 0 else ["pkexec", helper, *args]
     try:
         result = subprocess.run(
             argv,

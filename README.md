@@ -11,7 +11,8 @@ folder with my other machines" into a two minute job:
 * starts, stops, restarts Samba and toggles whether it runs at boot,
 * creates, edits and removes shares with a folder picker,
 * defaults every new share to the current user,
-* sets that user's Samba password.
+* sets that user's Samba password,
+* and does the same from the terminal: `smbmanager add ~/Media`.
 
 The window follows the traditional GTK layout Thunar uses — server side
 decorations, a menubar, a toolbar and a statusbar — rather than a client side
@@ -56,6 +57,70 @@ It also runs straight from a checkout without installing anything:
 
 The statusbar shows where to reach the share, for example
 `smb://192.168.178.18/Media`. From Windows that is `\\192.168.178.18\Media`.
+
+## From the command line
+
+`smbmanager` opens the window when you run it with no arguments. Give it a sub
+command and it stays in the terminal, doing the same work through the same
+polkit helper.
+
+```sh
+smbmanager add ~/Media                    # share a folder, read-write, as you
+smbmanager add ~/Media -n Films -c "Movie night"
+smbmanager add /srv/public --guest        # no password required
+smbmanager add ~/Notes -r -u alice -u bob # read only, for two accounts
+smbmanager list                           # what is shared right now
+```
+
+```
+$ smbmanager add ~/Media
+Added share 'Media' -> /home/you/Media (read-write)
+Started the Samba service.
+Reachable at  smb://192.168.178.18/Media
+```
+
+The share name defaults to the folder's own name, the allowed user to you, and
+Samba is started if it is not running yet (`--no-start` skips that). A folder
+that is already shared under another name is pointed out; a name that is already
+taken is refused unless you pass `--force`.
+
+### Sharing a file
+
+Samba exports directories, not individual files — there is no protocol level way
+to publish a single file. Passing one to `smbmanager add` therefore shares **the
+folder that contains it**, says so, and makes that share read only, since opening
+a whole folder up for writing on account of one file is rarely what you meant:
+
+```
+$ smbmanager add ~/Documents/report.pdf
+Samba exports folders, not single files, so the folder holding the file is
+shared instead:  /home/you/Documents
+Everything else in that folder becomes reachable too. The share is read only
+unless you pass --writable.
+
+Added share 'Documents' -> /home/you/Documents (read-only)
+```
+
+If that is too much to expose, put the file in a folder of its own first.
+
+### Options for `add`
+
+| Option | Effect |
+| --- | --- |
+| `-n, --name NAME` | share name (default: the folder's own name) |
+| `-c, --comment TEXT` | description shown to clients |
+| `-u, --user USER` | user allowed in, repeatable (default: you) |
+| `-g, --guest` | allow access without a password |
+| `-w, --writable` | allow clients to change files |
+| `-r, --read-only` | export the share read only |
+| `--no-browse` | hide the share from network browsing |
+| `--force` | replace an existing share of the same name |
+| `--no-start` | do not start the Samba service afterwards |
+
+Each `add` authenticates through polkit, exactly as the GUI does. In a desktop
+session that is the usual password dialog. On a plain console, where no polkit
+agent is running, use `sudo smbmanager add …` instead — the helper is then run
+directly and `SUDO_USER` is still used as the share's default user.
 
 ## How it works
 
@@ -138,6 +203,7 @@ sudo pacman -Syu
 
 ```
 bin/smbmanager                  launcher
+smbmanager/cli.py               sub commands, and the GUI/CLI fork
 smbmanager/shares.py            share file parser / writer
 smbmanager/system.py            status queries, pkexec calls, app state
 smbmanager/dialogs.py           share editor and password prompt
