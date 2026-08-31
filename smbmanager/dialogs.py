@@ -1,4 +1,4 @@
-"""Dialogs: editing a share, server settings, and the Samba password."""
+"""Dialogs: editing shares and exports, server settings, and passwords."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ gi.require_version("Gtk", "3.0")
 from gi.repository import GLib, Gtk  # noqa: E402
 
 from . import system  # noqa: E402
+from .exports import Client, Export  # noqa: E402
 from .shares import PROTOCOLS, Share, ServerSettings  # noqa: E402
 
 
@@ -429,3 +430,138 @@ class ServerSettingsDialog(Gtk.Dialog):
 
     def problem(self) -> str | None:
         return self.get_settings().validate()
+
+
+class ExportDialog(Gtk.Dialog):
+    """Create or edit a single NFS export."""
+
+    def __init__(self, parent, export: Export | None = None, existing_paths=()):
+        editing = export is not None
+        super().__init__(
+            title="Edit export" if editing else "New export",
+            transient_for=parent,
+            modal=True,
+            use_header_bar=True,
+        )
+        self.set_default_size(540, -1)
+        self._existing = set(existing_paths)
+        self._editing_path = export.path if editing else None
+
+        self.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        save = self.add_button("Save" if editing else "Add",
+                               Gtk.ResponseType.OK)
+        save.get_style_context().add_class("suggested-action")
+        self.set_default_response(Gtk.ResponseType.OK)
+
+        grid = Gtk.Grid(row_spacing=10, column_spacing=12, margin=18)
+        grid.set_valign(Gtk.Align.START)
+        self.get_content_area().add(grid)
+
+        row = 0
+        self.folder = Gtk.FileChooserButton(
+            title="Select the folder to export",
+            action=Gtk.FileChooserAction.SELECT_FOLDER,
+        )
+        self.folder.set_hexpand(True)
+        grid.attach(_row_label("Folder"), 0, row, 1, 1)
+        grid.attach(self.folder, 1, row, 1, 1)
+        row += 1
+
+        self.comment = Gtk.Entry(hexpand=True)
+        self.comment.set_placeholder_text("Optional description")
+        grid.attach(_row_label("Description"), 0, row, 1, 1)
+        grid.attach(self.comment, 1, row, 1, 1)
+        row += 1
+
+        grid.attach(Gtk.Separator(), 0, row, 2, 1)
+        row += 1
+
+        self.clients = Gtk.Entry(hexpand=True)
+        self.clients.set_placeholder_text("*  or  192.168.1.0/24  or  host.lan")
+        self.clients.set_tooltip_text(
+            "Who may mount this export. Space separated: host names, "
+            "addresses, subnets, or * for everyone who can reach this machine."
+        )
+        grid.attach(_row_label("Clients"), 0, row, 1, 1)
+        grid.attach(self.clients, 1, row, 1, 1)
+        row += 1
+
+        self.writable = self._switch_row(
+            grid, row, "Allow writing",
+            "Clients may create and change files (rw instead of ro).",
+        )
+        row += 1
+        self.sync = self._switch_row(
+            grid, row, "Write safely",
+            "Confirm writes only once they reached the disk. Turning this "
+            "off is faster and risks losing data if the server crashes.",
+        )
+        row += 1
+        self.root_squash = self._switch_row(
+            grid, row, "Squash remote root",
+            "Treat a client's root as an anonymous user instead of this "
+            "machine's root. Leave this on unless you know you need it.",
+        )
+        row += 1
+        self.all_squash = self._switch_row(
+            grid, row, "Squash every user",
+            "Map all client users to the anonymous account, so files belong "
+            "to nobody in particular.",
+        )
+        row += 1
+
+        self.note = Gtk.Label(xalign=0.0, wrap=True)
+        self.note.get_style_context().add_class("dim-label")
+        grid.attach(self.note, 0, row, 2, 1)
+
+        self._export = export or Export(path="", clients=[Client(spec="*")])
+        self._load(self._export)
+        self.show_all()
+
+    _switch_row = ShareDialog._switch_row
+
+    def _load(self, export: Export):
+        if export.path:
+            self.folder.set_filename(export.path)
+        self.comment.set_text(export.comment)
+        self.clients.set_text(" ".join(c.spec for c in export.clients))
+        first = export.clients[0] if export.clients else Client()
+        self.writable.set_active(first.writable)
+        self.sync.set_active(first.sync)
+        self.root_squash.set_active(first.root_squash)
+        self.all_squash.set_active(first.all_squash)
+        if export.clients and not export.uniform():
+            self.note.set_markup(
+                "<b>This export gives different options to different "
+                "clients.</b> The switches show the first client's settings; "
+                "saving applies them to all of them."
+            )
+
+    def get_export(self) -> Export:
+        export = self._export
+        export.path = self.folder.get_filename() or export.path
+        export.comment = self.comment.get_text().strip()
+        previous = {c.spec: c for c in export.clients}
+        clients = []
+        for spec in self.clients.get_text().split():
+            # keep options this application does not model, per client
+            extra = previous[spec].extra if spec in previous else []
+            clients.append(Client(
+                spec=spec,
+                writable=self.writable.get_active(),
+                sync=self.sync.get_active(),
+                root_squash=self.root_squash.get_active(),
+                all_squash=self.all_squash.get_active(),
+                extra=list(extra),
+            ))
+        export.clients = clients
+        return export
+
+    def problem(self) -> str | None:
+        export = self.get_export()
+        error = export.validate()
+        if error:
+            return error
+        if export.path != self._editing_path and export.path in self._existing:
+            return f"'{export.path}' is already exported."
+        return None

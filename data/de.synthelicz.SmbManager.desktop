@@ -1,11 +1,11 @@
 [Desktop Entry]
 Type=Application
 Name=SMB Manager
-GenericName=Windows File Sharing
-Comment=Share folders over SMB and control the Samba service
+GenericName=Network File Sharing
+Comment=Share folders over SMB and NFS, and control both servers
 Exec=smbmanager
 Icon=folder-publicshare
 Terminal=false
 Categories=System;Filesystem;
-Keywords=samba;smb;share;network;windows;fileshare;
+Keywords=samba;smb;nfs;export;share;network;windows;fileshare;
 StartupNotify=true

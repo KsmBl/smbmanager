@@ -12,10 +12,10 @@ import os
 import re
 import sys
 
-from . import __version__, shares as shares_mod, system
+from . import __version__, exports as exports_mod, shares as shares_mod, system
 
 # Sub commands that keep us out of GTK.  Everything else starts the window.
-CLI_COMMANDS = ("add", "list", "server")
+CLI_COMMANDS = ("add", "list", "server", "nfs")
 
 _SANITISE_RE = re.compile(r"[^A-Za-z0-9 ._-]+")
 
@@ -257,6 +257,118 @@ def cmd_server(args) -> int:
     return 0
 
 
+# ------------------------------------------------------------------- nfs
+
+
+def require_nfs() -> str | None:
+    if not system.nfs_installed():
+        return (
+            "NFS is not installed.\n"
+            "Install it with 'sudo pacman -S nfs-utils', or open the SMB "
+            "Manager window, which offers to do it for you."
+        )
+    return None
+
+
+def cmd_nfs_add(args) -> int:
+    problem = require_nfs()
+    if problem:
+        return fail(problem)
+
+    target = os.path.realpath(os.path.expanduser(args.path))
+    if not os.path.isdir(target):
+        if os.path.exists(target):
+            return fail(
+                f"{target} is a file. NFS exports whole folders, so pass the "
+                "folder you want to offer."
+            )
+        return fail(f"no such folder: {target}")
+
+    specs = []
+    for value in args.clients or []:
+        specs.extend(_split(value))
+    template = exports_mod.Client(
+        writable=not args.read_only,
+        sync=not args.async_writes,
+        root_squash=not args.no_root_squash,
+        all_squash=args.all_squash,
+    )
+    export = exports_mod.Export(
+        path=target,
+        comment=args.comment,
+        clients=[
+            exports_mod.Client(
+                spec=spec,
+                writable=template.writable,
+                sync=template.sync,
+                root_squash=template.root_squash,
+                all_squash=template.all_squash,
+            )
+            for spec in (specs or ["*"])
+        ],
+    )
+
+    problem = export.validate()
+    if problem:
+        return fail(problem)
+
+    existing = exports_mod.load()
+    clash = next((e for e in existing if e.path == export.path), None)
+    if clash and not args.force:
+        return fail(
+            f"'{clash.path}' is already exported.\n"
+            "Pass --force to replace that export."
+        )
+    if clash:
+        existing = [e for e in existing if e is not clash]
+
+    try:
+        system.run_privileged(
+            ["nfs-apply"], stdin_data=exports_mod.dump(existing + [export])
+        )
+    except system.PrivilegedError as exc:
+        return fail(str(exc))
+
+    access = "read-write" if export.clients[0].writable else "read-only"
+    print(f"Exporting {export.path} ({access}) to "
+          + ", ".join(c.spec for c in export.clients))
+
+    if not args.no_start and not system.nfs_service_active():
+        try:
+            system.run_privileged(["nfs-service", "start"])
+            print("Started the NFS server.")
+        except system.PrivilegedError as exc:
+            print(f"The export was saved, but NFS did not start: {exc}",
+                  file=sys.stderr)
+
+    address = (system.local_addresses() or [system.hostname()])[0]
+    print(f"Mount it with  sudo mount -t nfs {address}:{export.path} /mnt")
+    if any(c.spec == "*" for c in export.clients):
+        print()
+        print(
+            "Note: * means every host that can reach this machine. NFS "
+            "authenticates the client, not a user, so restrict it with "
+            "--client 192.168.1.0/24 if this is not a trusted network."
+        )
+    return 0
+
+
+def cmd_nfs_list(args) -> int:
+    all_exports = sorted(exports_mod.load(), key=lambda e: e.path.lower())
+    if not all_exports:
+        print("No NFS exports are managed by SMB Manager yet.")
+        return 0
+    for export in all_exports:
+        first = export.clients[0] if export.clients else exports_mod.Client()
+        access = "read-write" if first.writable else "read-only"
+        print(f"{export.path}  ({access})")
+        if export.comment:
+            print(f"    {export.comment}")
+        for client in export.clients:
+            print(f"    {client.spec}  ({','.join(client.options())})")
+    return 0
+
+
 # ---------------------------------------------------------------- parsing
 
 
@@ -334,6 +446,45 @@ def build_parser() -> argparse.ArgumentParser:
                         help="newest dialect a client may use "
                              "(empty: Samba's own default)")
     server.set_defaults(func=cmd_server)
+
+    nfs = subparsers.add_parser(
+        "nfs",
+        help="offer folders over NFS instead of SMB",
+        description="NFS is the file sharing Unix and Linux clients speak "
+                    "natively. It trusts hosts rather than passwords, so who "
+                    "may mount an export is decided by address.",
+    )
+    nfs_commands = nfs.add_subparsers(dest="nfs_command")
+
+    nfs_add = nfs_commands.add_parser("add", help="export a folder over NFS")
+    nfs_add.add_argument("path", help="folder to export")
+    nfs_add.add_argument("-c", "--comment", default="",
+                         help="description kept as a comment in the file")
+    nfs_add.add_argument("--client", dest="clients", action="append",
+                         metavar="SPEC",
+                         help="host, subnet or wildcard allowed to mount, "
+                              "repeatable (default: *)")
+    nfs_add.add_argument("-r", "--read-only", action="store_true",
+                         help="export read only")
+    nfs_add.add_argument("--no-root-squash", action="store_true",
+                         help="let a client's root act as root here "
+                              "(rarely a good idea)")
+    nfs_add.add_argument("--all-squash", action="store_true",
+                         help="map every client user to the anonymous account")
+    nfs_add.add_argument("--async", dest="async_writes", action="store_true",
+                         help="acknowledge writes before they reach the disk")
+    nfs_add.add_argument("--force", action="store_true",
+                         help="replace an existing export of the same folder")
+    nfs_add.add_argument("--no-start", action="store_true",
+                         help="do not start the NFS server afterwards")
+    nfs_add.set_defaults(func=cmd_nfs_add)
+
+    nfs_list = nfs_commands.add_parser(
+        "list", help="show the exports managed by SMB Manager"
+    )
+    nfs_list.set_defaults(func=cmd_nfs_list)
+
+    nfs.set_defaults(func=lambda _a: (nfs.print_help(), 0)[1])
 
     return parser
 

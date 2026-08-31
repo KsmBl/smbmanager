@@ -8,13 +8,16 @@ import os
 import gi
 
 gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")  # without this Gdk 4 wins whenever this
+                                  # module is imported before app.py
 
 from gi.repository import Gdk, GLib, Gtk  # noqa: E402
 
+from . import exports as exports_mod  # noqa: E402
 from . import shares as shares_mod  # noqa: E402
 from . import system  # noqa: E402
 from .dialogs import (  # noqa: E402
-    PasswordDialog, ServerSettingsDialog, ShareDialog,
+    ExportDialog, PasswordDialog, ServerSettingsDialog, ShareDialog,
 )
 
 CSS = b"""
@@ -106,6 +109,83 @@ class ShareRow(Gtk.ListBoxRow):
             yield "⚠ folder is missing"
 
 
+class ExportRow(Gtk.ListBoxRow):
+    """One NFS export.  The folder is the identity - NFS has no share names."""
+
+    def __init__(self, export, on_edit, on_delete):
+        super().__init__()
+        self.export = export
+        self.set_can_focus(False)
+        box = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=12, margin=12
+        )
+        self.add(box)
+
+        icon = Gtk.Image.new_from_icon_name(
+            "folder-remote-symbolic", Gtk.IconSize.DND
+        )
+        icon.set_valign(Gtk.Align.START)
+        box.add(icon)
+
+        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        text.set_hexpand(True)
+        box.add(text)
+
+        title = Gtk.Label(label=export.path, xalign=0.0)
+        title.get_style_context().add_class("share-name")
+        title.set_ellipsize(3)
+        text.add(title)
+
+        if export.comment:
+            comment = Gtk.Label(label=export.comment, xalign=0.0)
+            comment.get_style_context().add_class("dim-label")
+            comment.set_ellipsize(3)
+            text.add(comment)
+
+        badges = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        for caption in self._badges(export):
+            label = Gtk.Label(label=caption, xalign=0.0)
+            label.get_style_context().add_class("dim-label")
+            badges.add(label)
+        text.add(badges)
+
+        edit = Gtk.Button.new_from_icon_name(
+            "document-edit-symbolic", Gtk.IconSize.BUTTON
+        )
+        edit.set_tooltip_text("Edit this export")
+        edit.set_valign(Gtk.Align.CENTER)
+        edit.connect("clicked", lambda _b: on_edit(export))
+        box.add(edit)
+
+        delete = Gtk.Button.new_from_icon_name(
+            "user-trash-symbolic", Gtk.IconSize.BUTTON
+        )
+        delete.set_tooltip_text("Remove this export")
+        delete.set_valign(Gtk.Align.CENTER)
+        delete.connect("clicked", lambda _b: on_delete(export))
+        box.add(delete)
+
+    @staticmethod
+    def _badges(export):
+        clients = export.clients
+        yield "clients: " + (
+            ", ".join(c.spec for c in clients) if clients else "none"
+        )
+        if clients:
+            first = clients[0]
+            yield "writable" if first.writable else "read only"
+            if not first.root_squash:
+                yield "⚠ remote root allowed"
+            if first.all_squash:
+                yield "all users squashed"
+            if not first.sync:
+                yield "async"
+            if not export.uniform():
+                yield "per client options"
+        if export.path and not os.path.isdir(export.path):
+            yield "⚠ folder is missing"
+
+
 class MainWindow(Gtk.ApplicationWindow):
     def __init__(self, application):
         super().__init__(application=application, title="SMB Manager")
@@ -114,6 +194,8 @@ class MainWindow(Gtk.ApplicationWindow):
         self.status = system.Status()
         self.shares = []
         self.settings = shares_mod.ServerSettings()
+        self.exports = []
+        self.nfs = system.NfsStatus()
         self._busy = 0
 
         self._warning_action = None
@@ -177,11 +259,34 @@ class MainWindow(Gtk.ApplicationWindow):
             samba_menu, "Repair Installation…", self.on_repair
         )
 
+        nfs_menu = Gtk.Menu()
+        self.nfs_start_item = self._menu_item(
+            nfs_menu, "_Start", lambda: self.on_nfs_service("start")
+        )
+        self.nfs_stop_item = self._menu_item(
+            nfs_menu, "S_top", lambda: self.on_nfs_service("stop")
+        )
+        self.nfs_restart_item = self._menu_item(
+            nfs_menu, "_Restart", lambda: self.on_nfs_service("restart")
+        )
+        nfs_menu.append(Gtk.SeparatorMenuItem())
+        self.nfs_boot_item = Gtk.CheckMenuItem(label="Start at _Boot",
+                                               use_underline=True)
+        self._nfs_boot_handler = self.nfs_boot_item.connect(
+            "toggled", self.on_nfs_boot_toggled
+        )
+        nfs_menu.append(self.nfs_boot_item)
+        nfs_menu.append(Gtk.SeparatorMenuItem())
+        self.nfs_install_item = self._menu_item(
+            nfs_menu, "_Install NFS…", self.on_nfs_install
+        )
+
         help_menu = Gtk.Menu()
         self._menu_item(help_menu, "_About", self.on_about)
 
         for label, menu in (
-            ("_File", file_menu), ("_Samba", samba_menu), ("_Help", help_menu)
+            ("_File", file_menu), ("_Samba", samba_menu), ("_NFS", nfs_menu),
+            ("_Help", help_menu)
         ):
             item = Gtk.MenuItem(label=label, use_underline=True)
             item.set_submenu(menu)
@@ -203,7 +308,7 @@ class MainWindow(Gtk.ApplicationWindow):
 
         self.add_button = tool(
             "list-add", "Add Share", "Share a folder (Ctrl+N)",
-            self.on_add_share, important=True,
+            self.on_add, important=True,
         )
         self.reload_button = tool(
             "view-refresh", "Reload", "Read the configuration again (F5)",
@@ -211,16 +316,16 @@ class MainWindow(Gtk.ApplicationWindow):
         )
         bar.insert(Gtk.SeparatorToolItem(), -1)
         self.start_button = tool(
-            "media-playback-start", "Start", "Start the Samba service",
-            lambda: self.on_service("start"),
+            "media-playback-start", "Start", "Start the file server",
+            lambda: self.on_any_service("start"),
         )
         self.stop_button = tool(
-            "media-playback-stop", "Stop", "Stop the Samba service",
-            lambda: self.on_service("stop"),
+            "media-playback-stop", "Stop", "Stop the file server",
+            lambda: self.on_any_service("stop"),
         )
         self.restart_button = tool(
-            "system-reboot", "Restart", "Restart the Samba service",
-            lambda: self.on_service("restart"),
+            "system-reboot", "Restart", "Restart the file server",
+            lambda: self.on_any_service("restart"),
         )
 
         spacer = Gtk.SeparatorToolItem()
@@ -263,33 +368,24 @@ class MainWindow(Gtk.ApplicationWindow):
         self.infobar.set_no_show_all(True)
         outer.pack_start(self.infobar, False, False, 0)
 
-        scroller = Gtk.ScrolledWindow()
-        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        scroller.set_shadow_type(Gtk.ShadowType.IN)
-        scroller.set_vexpand(True)
-        outer.pack_start(scroller, True, True, 0)
+        self.notebook = Gtk.Notebook()
+        self.notebook.set_vexpand(True)
+        outer.pack_start(self.notebook, True, True, 0)
 
-        self.share_list = Gtk.ListBox()
-        self.share_list.set_selection_mode(Gtk.SelectionMode.NONE)
-        self.share_list.connect(
-            "row-activated", lambda _lb, row: self.on_edit_share(row.share)
+        self.share_list, share_page = self._list_page(
+            "folder-publicshare-symbolic",
+            "No shares yet — use Add Share to share a folder.",
+            lambda _lb, row: self.on_edit_share(row.share),
         )
-        placeholder = Gtk.Box(
-            orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=32
+        self.notebook.append_page(share_page, Gtk.Label(label="SMB Shares"))
+
+        self.export_list, export_page = self._list_page(
+            "folder-remote-symbolic",
+            "No exports yet — use Add Export to offer a folder over NFS.",
+            lambda _lb, row: self.on_edit_export(row.export),
         )
-        empty_icon = Gtk.Image.new_from_icon_name(
-            "folder-publicshare-symbolic", Gtk.IconSize.DIALOG
-        )
-        empty_icon.get_style_context().add_class("dim-label")
-        placeholder.add(empty_icon)
-        empty_label = Gtk.Label(
-            label="No shares yet — use Add Share to share a folder."
-        )
-        empty_label.get_style_context().add_class("dim-label")
-        placeholder.add(empty_label)
-        placeholder.show_all()
-        self.share_list.set_placeholder(placeholder)
-        scroller.add(self.share_list)
+        self.notebook.append_page(export_page, Gtk.Label(label="NFS Exports"))
+        self.notebook.connect("switch-page", self._on_tab_switched)
 
         self.statusbar = Gtk.Statusbar()
         self._status_context = self.statusbar.get_context_id("state")
@@ -299,8 +395,52 @@ class MainWindow(Gtk.ApplicationWindow):
         for button in (self.add_button, self.reload_button, self.start_button,
                        self.stop_button, self.restart_button):
             button.set_focus_on_click(False)
-        self.set_focus_child(scroller)
+        self.set_focus_child(self.notebook)
         GLib.idle_add(self.share_list.grab_focus)
+
+    def _list_page(self, icon_name, empty_text, on_activate):
+        """A scrolled ListBox with a placeholder, used by both tabs."""
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroller.set_shadow_type(Gtk.ShadowType.IN)
+        scroller.set_vexpand(True)
+
+        listbox = Gtk.ListBox()
+        listbox.set_selection_mode(Gtk.SelectionMode.NONE)
+        listbox.connect("row-activated", on_activate)
+
+        placeholder = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=32
+        )
+        icon = Gtk.Image.new_from_icon_name(icon_name, Gtk.IconSize.DIALOG)
+        icon.get_style_context().add_class("dim-label")
+        placeholder.add(icon)
+        label = Gtk.Label(label=empty_text)
+        label.get_style_context().add_class("dim-label")
+        label.set_line_wrap(True)
+        placeholder.add(label)
+        placeholder.show_all()
+        listbox.set_placeholder(placeholder)
+
+        scroller.add(listbox)
+        return listbox, scroller
+
+    def on_nfs_tab(self) -> bool:
+        """True when the NFS tab is the one in front."""
+        return self.notebook.get_current_page() == 1
+
+    def _on_tab_switched(self, _notebook, _page, index):
+        # _render reads the current page, which is not updated yet here.
+        GLib.idle_add(self._render)
+
+    def on_add(self):
+        self.on_add_export() if self.on_nfs_tab() else self.on_add_share()
+
+    def on_any_service(self, action: str):
+        if self.on_nfs_tab():
+            self.on_nfs_service(action)
+        else:
+            self.on_service(action)
 
     def _quit(self):
         application = self.get_application()
@@ -311,11 +451,15 @@ class MainWindow(Gtk.ApplicationWindow):
             self.on_install()
         elif self._warning_action == "repair":
             self.on_repair()
+        elif self._warning_action == "install-nfs":
+            self.on_nfs_install()
 
     def refresh(self, notify: bool = False):
         self.status = system.Status()
+        self.nfs = system.NfsStatus()
         self.shares = shares_mod.load()
         self.settings = shares_mod.load_settings()
+        self.exports = exports_mod.load()
         self._render()
         if notify:
             self.message("Reloaded from disk.")
@@ -324,8 +468,23 @@ class MainWindow(Gtk.ApplicationWindow):
         status = self.status
         installed, active = status.installed, status.active
         broken = installed and not status.healthy
+        nfs_tab = self.on_nfs_tab()
 
-        if not installed:
+        self.add_button.set_label("Add Export" if nfs_tab else "Add Share")
+        self.add_button.set_tooltip_text(
+            "Offer a folder over NFS" if nfs_tab
+            else "Share a folder (Ctrl+N)"
+        )
+        for button, verb in ((self.start_button, "Start"),
+                             (self.stop_button, "Stop"),
+                             (self.restart_button, "Restart")):
+            button.set_tooltip_text(
+                f"{verb} the {'NFS' if nfs_tab else 'Samba'} service"
+            )
+
+        if nfs_tab:
+            self._render_nfs()
+        elif not installed:
             self._warning_action = "install"
             self.warning_bar.set_message_type(Gtk.MessageType.INFO)
             self.warning_label.set_text(
@@ -348,22 +507,37 @@ class MainWindow(Gtk.ApplicationWindow):
             self._warning_action = None
             self._show_warning(False)
 
-        self.add_button.set_sensitive(installed)
+        nfs = self.nfs
+        self.add_button.set_sensitive(nfs.installed if nfs_tab else installed)
         self.add_item.set_sensitive(installed)
         self.password_item.set_sensitive(installed)
         self.settings_item.set_sensitive(installed)
         self.install_item.set_sensitive(not installed)
         self.repair_item.set_sensitive(broken)
-        for widget in (self.start_button, self.start_item):
-            widget.set_sensitive(status.usable and not active)
-        for widget in (self.stop_button, self.stop_item):
-            widget.set_sensitive(status.usable and active)
-        for widget in (self.restart_button, self.restart_item):
-            widget.set_sensitive(status.usable and active)
+        self.nfs_install_item.set_sensitive(not nfs.installed)
+
+        # The menus always drive their own protocol; the toolbar follows the
+        # tab, so its buttons take the state of whichever service that is.
+        self.start_item.set_sensitive(status.usable and not active)
+        self.stop_item.set_sensitive(status.usable and active)
+        self.restart_item.set_sensitive(status.usable and active)
+        self.nfs_start_item.set_sensitive(nfs.usable and not nfs.active)
+        self.nfs_stop_item.set_sensitive(nfs.usable and nfs.active)
+        self.nfs_restart_item.set_sensitive(nfs.usable and nfs.active)
+
+        usable, running = (
+            (nfs.usable, nfs.active) if nfs_tab else (status.usable, active)
+        )
+        self.start_button.set_sensitive(usable and not running)
+        self.stop_button.set_sensitive(usable and running)
+        self.restart_button.set_sensitive(usable and running)
 
         self.boot_item.set_sensitive(status.usable)
         with self.boot_item.handler_block(self._boot_handler):
             self.boot_item.set_active(status.enabled)
+        self.nfs_boot_item.set_sensitive(nfs.usable)
+        with self.nfs_boot_item.handler_block(self._nfs_boot_handler):
+            self.nfs_boot_item.set_active(nfs.enabled)
 
         for child in self.share_list.get_children():
             self.share_list.remove(child)
@@ -373,8 +547,31 @@ class MainWindow(Gtk.ApplicationWindow):
             )
         self.share_list.show_all()
 
+        for child in self.export_list.get_children():
+            self.export_list.remove(child)
+        for export in sorted(self.exports, key=lambda e: e.path.lower()):
+            self.export_list.add(
+                ExportRow(export, self.on_edit_export, self.on_delete_export)
+            )
+        self.export_list.show_all()
+
         self.statusbar.pop(self._status_context)
         self.statusbar.push(self._status_context, self._status_text())
+
+    def _render_nfs(self):
+        """The warning bar while the NFS tab is in front."""
+        if not self.nfs.installed:
+            self._warning_action = "install-nfs"
+            self.warning_bar.set_message_type(Gtk.MessageType.INFO)
+            self.warning_label.set_text(
+                "NFS is not installed. The nfs-utils package provides the "
+                "server that offers your folders to Unix and Linux clients."
+            )
+            self.warning_action.set_label("Install NFS")
+            self._show_warning(True)
+        else:
+            self._warning_action = None
+            self._show_warning(False)
 
     def _show_warning(self, visible: bool):
         self.warning_bar.set_no_show_all(not visible)
@@ -385,6 +582,8 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def _status_text(self) -> str:
         """The statusbar summary, in the spirit of a file manager's."""
+        if self.on_nfs_tab():
+            return self._nfs_status_text()
         count = len(self.shares)
         shares = f"{count} share{'' if count == 1 else 's'}"
         if not self.status.installed:
@@ -397,6 +596,19 @@ class MainWindow(Gtk.ApplicationWindow):
             address = (system.local_addresses() or [system.hostname()])[0]
             first = sorted(self.shares, key=lambda s: s.name.lower())[0].name
             parts.append(f"smb://{address}/{first}")
+        return "  |  ".join(parts)
+
+    def _nfs_status_text(self) -> str:
+        count = len(self.exports)
+        exports = f"{count} export{'' if count == 1 else 's'}"
+        if not self.nfs.installed:
+            return "NFS is not installed"
+        state = "NFS is running" if self.nfs.active else "NFS is stopped"
+        parts = [state, exports]
+        if self.nfs.active and self.exports:
+            address = (system.local_addresses() or [system.hostname()])[0]
+            first = sorted(self.exports, key=lambda e: e.path.lower())[0].path
+            parts.append(f"{address}:{first}")
         return "  |  ".join(parts)
 
     def message(self, text: str, kind=Gtk.MessageType.INFO):
@@ -449,7 +661,7 @@ class MainWindow(Gtk.ApplicationWindow):
         for widget in (
             self.menubar, self.add_button, self.reload_button,
             self.start_button, self.stop_button, self.restart_button,
-            self.share_list, self.warning_action,
+            self.share_list, self.export_list, self.warning_action,
         ):
             widget.set_sensitive(not running)
         if not running:
@@ -717,13 +929,113 @@ class MainWindow(Gtk.ApplicationWindow):
 
         system.run_async(work, success, failed)
 
+    # ----------------------------------------------------------------- nfs
+    def on_nfs_install(self):
+        self.privileged(
+            ["nfs-install"],
+            busy_text="Installing nfs-utils with pacman…",
+            done=lambda _out: self.message(
+                "NFS is installed. Press Start to run the server."
+            ),
+        )
+
+    def on_nfs_service(self, action: str):
+        self.privileged(
+            ["nfs-service", action],
+            busy_text=f"Asking systemd to {action} the NFS server…",
+            done=lambda _out: self.message(f"NFS server: {action} done."),
+        )
+
+    def on_nfs_boot_toggled(self, item):
+        action = "enable" if item.get_active() else "disable"
+        self.privileged(
+            ["nfs-service", action],
+            busy_text=f"{action.capitalize()} NFS at boot…",
+            done=lambda _out: self.message(
+                "NFS will start at boot." if action == "enable"
+                else "NFS will no longer start at boot."
+            ),
+        )
+
+    def on_add_export(self):
+        dialog = ExportDialog(self, None, [e.path for e in self.exports])
+        self._run_export_dialog(dialog, replace=None)
+
+    def on_edit_export(self, export):
+        dialog = ExportDialog(
+            self, copy.deepcopy(export), [e.path for e in self.exports]
+        )
+        self._run_export_dialog(dialog, replace=export)
+
+    def _run_export_dialog(self, dialog, replace):
+        while True:
+            response = dialog.run()
+            if response != Gtk.ResponseType.OK:
+                dialog.destroy()
+                return
+            problem = dialog.problem()
+            if problem:
+                self.error(problem)
+                continue
+            export = dialog.get_export()
+            dialog.destroy()
+            break
+
+        updated = [e for e in self.exports if e is not replace]
+        updated.append(export)
+        self._save_exports(
+            updated, export,
+            "Export saved." if replace else f"'{export.path}' is now exported.",
+        )
+
+    def on_delete_export(self, export):
+        confirm = Gtk.MessageDialog(
+            transient_for=self,
+            modal=True,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.NONE,
+            text=f"Stop exporting '{export.path}'?",
+        )
+        confirm.format_secondary_text(
+            "The folder and its contents stay untouched, only the export is "
+            "removed. Clients that have it mounted will lose access."
+        )
+        confirm.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        remove = confirm.add_button("Remove export", Gtk.ResponseType.OK)
+        remove.get_style_context().add_class("destructive-action")
+        response = confirm.run()
+        confirm.destroy()
+        if response != Gtk.ResponseType.OK:
+            return
+        updated = [e for e in self.exports if e is not export]
+        self._save_exports(
+            updated, None, f"'{export.path}' is no longer exported."
+        )
+
+    def _save_exports(self, export_list, new_export, success_text):
+        queue = []
+        if new_export and not os.path.isdir(new_export.path):
+            queue.append((["mkdir", new_export.path, self.user], None))
+        queue.append((["nfs-apply"], exports_mod.dump(export_list)))
+
+        def done(_output):
+            text = success_text
+            if new_export and any(c.spec == "*" for c in new_export.clients):
+                text += (
+                    "  It is offered to every host that can reach this "
+                    "machine — NFS trusts the network, not a password."
+                )
+            self.message(text)
+
+        self._run_queue(queue, done, "Writing the NFS exports…")
+
     def on_about(self):
         about = Gtk.AboutDialog(transient_for=self, modal=True)
         about.set_program_name("SMB Manager")
         about.set_version("1.0.0")
         about.set_comments(
-            "Share folders over SMB, manage the Samba service and its users "
-            "on Arch Linux."
+            "Share folders over SMB and NFS, manage the Samba and NFS "
+            "services and their users on Arch Linux."
         )
         about.set_logo_icon_name("folder-publicshare")
         about.set_license_type(Gtk.License.GPL_3_0)
