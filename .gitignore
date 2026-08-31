@@ -1,5 +1,2 @@
 __pycache__/
 *.pyc
-
-# Editor / assistant scratch files
-.claude/
