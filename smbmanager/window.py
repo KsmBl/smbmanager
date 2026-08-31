@@ -13,7 +13,9 @@ from gi.repository import Gdk, GLib, Gtk  # noqa: E402
 
 from . import shares as shares_mod  # noqa: E402
 from . import system  # noqa: E402
-from .dialogs import PasswordDialog, ShareDialog  # noqa: E402
+from .dialogs import (  # noqa: E402
+    PasswordDialog, ServerSettingsDialog, ShareDialog,
+)
 
 CSS = b"""
 .share-name { font-weight: bold; }
@@ -94,6 +96,12 @@ class ShareRow(Gtk.ListBoxRow):
         )
         if not share.browseable:
             yield "hidden"
+        if share.max_connections:
+            yield f"max {share.max_connections}"
+        if share.hosts_allow:
+            yield "host restricted"
+        if not share.available:
+            yield "disabled"
         if share.path and not os.path.isdir(share.path):
             yield "⚠ folder is missing"
 
@@ -105,6 +113,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.user = system.current_user()
         self.status = system.Status()
         self.shares = []
+        self.settings = shares_mod.ServerSettings()
         self._busy = 0
 
         self._warning_action = None
@@ -156,6 +165,9 @@ class MainWindow(Gtk.ApplicationWindow):
         samba_menu.append(Gtk.SeparatorMenuItem())
         self.password_item = self._menu_item(
             samba_menu, "Set Samba _Password…", self.on_set_password
+        )
+        self.settings_item = self._menu_item(
+            samba_menu, "Server _Settings…", self.on_server_settings
         )
         samba_menu.append(Gtk.SeparatorMenuItem())
         self.install_item = self._menu_item(
@@ -303,6 +315,7 @@ class MainWindow(Gtk.ApplicationWindow):
     def refresh(self, notify: bool = False):
         self.status = system.Status()
         self.shares = shares_mod.load()
+        self.settings = shares_mod.load_settings()
         self._render()
         if notify:
             self.message("Reloaded from disk.")
@@ -338,6 +351,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.add_button.set_sensitive(installed)
         self.add_item.set_sensitive(installed)
         self.password_item.set_sensitive(installed)
+        self.settings_item.set_sensitive(installed)
         self.install_item.set_sensitive(not installed)
         self.repair_item.set_sensitive(broken)
         for widget in (self.start_button, self.start_item):
@@ -578,6 +592,30 @@ class MainWindow(Gtk.ApplicationWindow):
         else:
             dialog.destroy()
 
+    def on_server_settings(self):
+        dialog = ServerSettingsDialog(self, copy.deepcopy(self.settings))
+        while True:
+            if dialog.run() != Gtk.ResponseType.OK:
+                dialog.destroy()
+                return
+            problem = dialog.problem()
+            if problem:
+                self.error(problem)
+                continue
+            settings = dialog.get_settings()
+            dialog.destroy()
+            break
+
+        self.settings = settings
+        self._run_queue(
+            [(["apply"], shares_mod.dump(self.shares, settings))],
+            lambda _out: self.message(
+                "Server settings saved. Restart Samba to apply them to new "
+                "connections."
+            ),
+            "Writing the Samba configuration…",
+        )
+
     def on_add_share(self):
         dialog = ShareDialog(self, None, [s.name for s in self.shares])
         self._run_share_dialog(dialog, replace=None)
@@ -633,7 +671,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self._save_shares(updated, None, f"'{share.name}' is no longer shared.")
 
     def _save_shares(self, share_list, new_share, success_text):
-        content = shares_mod.dump(share_list)
+        content = shares_mod.dump(share_list, self.settings)
         args_queue = []
         if new_share and not os.path.isdir(new_share.path):
             args_queue.append((["mkdir", new_share.path, self.user], None))
