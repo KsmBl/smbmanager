@@ -47,9 +47,12 @@ def current_user() -> str:
 # ------------------------------------------------------------ unprivileged
 
 
+_SBIN_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+
 def samba_installed() -> bool:
     for name in ("smbd", "smbpasswd"):
-        if shutil.which(name, path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"):
+        if shutil.which(name, path=_SBIN_PATH):
             return True
     return os.path.exists("/usr/bin/smbd")
 
@@ -108,6 +111,16 @@ def pending_samba_updates() -> list:
     ]
 
 
+# ------------------------------------------------------------------- nfs
+
+
+def nfs_installed() -> bool:
+    for name in ("exportfs", "rpc.nfsd"):
+        if shutil.which(name, path=_SBIN_PATH):
+            return True
+    return os.path.exists("/usr/bin/exportfs")
+
+
 def _systemctl(*args) -> str:
     try:
         result = subprocess.run(
@@ -127,6 +140,14 @@ def service_active() -> bool:
 
 def service_enabled() -> bool:
     return _systemctl("is-enabled", "smb.service") == "enabled"
+
+
+def nfs_service_active() -> bool:
+    return _systemctl("is-active", "nfs-server.service") == "active"
+
+
+def nfs_service_enabled() -> bool:
+    return _systemctl("is-enabled", "nfs-server.service") == "enabled"
 
 
 def hostname() -> str:
@@ -175,6 +196,29 @@ class Status:
             return "Samba is not installed"
         if not self.healthy:
             return "Samba is installed but cannot run"
+        return "Running" if self.active else "Stopped"
+
+
+class NfsStatus:
+    """The NFS counterpart of :class:`Status`.
+
+    NFS has no equivalent of the partial upgrade trap - the server is a kernel
+    service, not a binary that can fail to link - so this is simpler.
+    """
+
+    def __init__(self):
+        self.installed = nfs_installed()
+        self.active = self.installed and nfs_service_active()
+        self.enabled = self.installed and nfs_service_enabled()
+
+    @property
+    def usable(self) -> bool:
+        return self.installed
+
+    @property
+    def summary(self) -> str:
+        if not self.installed:
+            return "NFS is not installed"
         return "Running" if self.active else "Stopped"
 
 

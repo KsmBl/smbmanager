@@ -15,6 +15,10 @@ Commands:
     passwd <user>               read a password on stdin, set it in Samba
     deluser <user>              remove a user from the Samba password db
     mkdir <path> <user>         create a share folder owned by <user>
+    nfs-status                  print a JSON status report for NFS
+    nfs-install                 install the nfs-utils package with pacman
+    nfs-apply                   read an exports file on stdin and install it
+    nfs-service <action>        start|stop|restart|enable|disable the server
 """
 
 from __future__ import annotations
@@ -32,6 +36,9 @@ SMB_CONF = "/etc/samba/smb.conf"
 SHARE_FILE = "/etc/samba/smbmanager.conf"
 INCLUDE_LINE = f"   include = {SHARE_FILE}"
 SERVICES = ("smb.service", "nmb.service")
+NFS_EXPORT_DIR = "/etc/exports.d"
+NFS_EXPORT_FILE = f"{NFS_EXPORT_DIR}/smbmanager.exports"
+NFS_SERVICES = ("nfs-server.service",)
 SAFE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 DEFAULT_SMB_CONF = f"""\
@@ -422,6 +429,106 @@ def cmd_mkdir(path: str, user: str):
     print(f"folder ready: {real}")
 
 
+# -------------------------------------------------------------------- nfs
+
+
+def nfs_installed() -> bool:
+    return shutil.which("exportfs", path=SAFE_PATH) is not None
+
+
+def cmd_nfs_status():
+    exports = []
+    if nfs_installed():
+        result = run([tool("exportfs"), "-s"])
+        exports = [
+            line.strip() for line in result.stdout.splitlines() if line.strip()
+        ]
+    state = {
+        "installed": nfs_installed(),
+        "exports_file": os.path.exists(NFS_EXPORT_FILE),
+        "active_exports": exports,
+    }
+    for unit in NFS_SERVICES:
+        key = unit.split(".")[0]
+        state[f"{key}_active"] = unit_state(["is-active", unit])
+        state[f"{key}_enabled"] = unit_state(["is-enabled", unit])
+    print(json.dumps(state))
+
+
+def cmd_nfs_install():
+    if nfs_installed():
+        print("nfs-utils is already installed")
+        return
+    pacman = shutil.which("pacman", path=SAFE_PATH)
+    if not pacman:
+        die("pacman was not found - this tool targets Arch Linux.")
+    print("Installing the nfs-utils package...", flush=True)
+    result = subprocess.run(
+        [pacman, "-S", "--needed", "--noconfirm", "nfs-utils"],
+        env=dict(os.environ, PATH=SAFE_PATH, LC_ALL="C"),
+    )
+    if result.returncode != 0:
+        die(
+            "pacman could not install nfs-utils.\n"
+            "If it complained about outdated packages, refresh the system "
+            "first with:  sudo pacman -Syu"
+        )
+    if not nfs_installed():
+        die("nfs-utils was installed but exportfs is still missing.")
+    print("nfs-utils installed")
+
+
+def cmd_nfs_apply():
+    if not nfs_installed():
+        die("nfs-utils is not installed yet.")
+    content = sys.stdin.read()
+    if len(content) > 512 * 1024:
+        die("The exports file is implausibly large, refusing to write.")
+    os.makedirs(NFS_EXPORT_DIR, exist_ok=True)
+
+    previous = None
+    if os.path.exists(NFS_EXPORT_FILE):
+        with open(NFS_EXPORT_FILE, "r", encoding="utf-8") as fh:
+            previous = fh.read()
+
+    write_root_file(NFS_EXPORT_FILE, content)
+    # exportfs has no dry run, so the new file is tried for real and rolled
+    # back if the kernel refuses it.
+    result = run([tool("exportfs"), "-ra"])
+    if result.returncode != 0:
+        if previous is None:
+            os.unlink(NFS_EXPORT_FILE)
+        else:
+            write_root_file(NFS_EXPORT_FILE, previous)
+        run([tool("exportfs"), "-ra"])
+        die("NFS rejected the exports:\n" + result.stderr.strip())
+    if result.stderr.strip():
+        # exportfs warns but still applies, e.g. about a missing directory.
+        print(result.stderr.strip(), file=sys.stderr)
+    print("exports applied")
+
+
+def cmd_nfs_service(action: str):
+    if action not in {"start", "stop", "restart", "enable", "disable"}:
+        die(f"Unknown service action '{action}'.")
+    if not nfs_installed():
+        die("nfs-utils is not installed yet.")
+    systemctl = tool("systemctl")
+    failures = []
+    for unit in NFS_SERVICES:
+        if run([systemctl, "cat", unit]).returncode != 0:
+            continue
+        result = run([systemctl, action, unit])
+        if result.returncode != 0:
+            failures.append(f"{unit}: {result.stderr.strip() or 'failed'}")
+    if failures:
+        die(
+            "systemctl " + action + " failed:\n" + "\n".join(failures)
+            + journal_tail("nfs-server.service")
+        )
+    print(f"{action} ok")
+
+
 def main(argv):
     if os.geteuid() != 0:
         die("This helper has to run as root (it is started via pkexec).")
@@ -439,6 +546,10 @@ def main(argv):
         "passwd": (cmd_passwd, 1),
         "deluser": (cmd_deluser, 1),
         "mkdir": (cmd_mkdir, 2),
+        "nfs-status": (cmd_nfs_status, 0),
+        "nfs-install": (cmd_nfs_install, 0),
+        "nfs-apply": (cmd_nfs_apply, 0),
+        "nfs-service": (cmd_nfs_service, 1),
     }
     if command not in table:
         die(f"Unknown command '{command}'.")
