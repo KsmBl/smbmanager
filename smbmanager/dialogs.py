@@ -1,4 +1,4 @@
-"""Dialogs: editing a share and setting the Samba password."""
+"""Dialogs: editing a share, server settings, and the Samba password."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ gi.require_version("Gtk", "3.0")
 from gi.repository import GLib, Gtk  # noqa: E402
 
 from . import system  # noqa: E402
-from .shares import Share  # noqa: E402
+from .shares import PROTOCOLS, Share, ServerSettings  # noqa: E402
 
 
 def _row_label(text: str) -> Gtk.Label:
@@ -108,11 +108,72 @@ class ShareDialog(Gtk.Dialog):
         self.hint = Gtk.Label(xalign=0.0, wrap=True)
         self.hint.get_style_context().add_class("dim-label")
         grid.attach(self.hint, 0, row, 2, 1)
+        row += 1
+
+        grid.attach(self._build_advanced(), 0, row, 2, 1)
 
         self._share = share or Share(name="", path="", valid_users=[self._user])
         self._load(self._share)
         self.show_all()
         self._update_hint()
+
+    # -- advanced ----------------------------------------------------------
+    def _build_advanced(self) -> Gtk.Expander:
+        """Options most people never touch, folded away until they do."""
+        expander = Gtk.Expander(label="Advanced")
+        expander.set_margin_top(6)
+        grid = Gtk.Grid(row_spacing=10, column_spacing=12, margin_top=12,
+                        margin_start=12)
+        expander.add(grid)
+
+        row = 0
+        self.max_connections = Gtk.SpinButton.new_with_range(0, 4096, 1)
+        self.max_connections.set_hexpand(True)
+        self.max_connections.set_halign(Gtk.Align.START)
+        self.max_connections.set_tooltip_text(
+            "How many clients may use this share at the same time. "
+            "0 leaves it to Samba."
+        )
+        limit_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        limit_box.add(self.max_connections)
+        unlimited = Gtk.Label(label="0 = no limit", xalign=0.0)
+        unlimited.get_style_context().add_class("dim-label")
+        limit_box.add(unlimited)
+        grid.attach(_row_label("Max connections"), 0, row, 1, 1)
+        grid.attach(limit_box, 1, row, 1, 1)
+        row += 1
+
+        self.write_list = Gtk.Entry(hexpand=True)
+        self.write_list.set_placeholder_text("Space separated user names")
+        self.write_list.set_tooltip_text(
+            "Users who may write even when the share is read only."
+        )
+        grid.attach(_row_label("Write anyway"), 0, row, 1, 1)
+        grid.attach(self.write_list, 1, row, 1, 1)
+        row += 1
+
+        self.hosts_allow = Gtk.Entry(hexpand=True)
+        self.hosts_allow.set_placeholder_text("Any host  (e.g. 192.168.1.)")
+        self.hosts_allow.set_tooltip_text(
+            "Only these hosts may connect. Names, addresses or subnets such "
+            "as 192.168.1. or 192.168.1.0/24."
+        )
+        grid.attach(_row_label("Allowed hosts"), 0, row, 1, 1)
+        grid.attach(self.hosts_allow, 1, row, 1, 1)
+        row += 1
+
+        self.hosts_deny = Gtk.Entry(hexpand=True)
+        self.hosts_deny.set_placeholder_text("No host")
+        self.hosts_deny.set_tooltip_text("Hosts that are turned away.")
+        grid.attach(_row_label("Denied hosts"), 0, row, 1, 1)
+        grid.attach(self.hosts_deny, 1, row, 1, 1)
+        row += 1
+
+        self.available = self._switch_row(
+            grid, row, "Share is available",
+            "Turn off to park the share without deleting it.",
+        )
+        return expander
 
     # -- helpers -----------------------------------------------------------
     def _switch_row(self, grid, row, title, subtitle) -> Gtk.Switch:
@@ -139,6 +200,11 @@ class ShareDialog(Gtk.Dialog):
         self.guest.set_active(share.guest_ok)
         self.browseable.set_active(share.browseable)
         self.users.set_sensitive(not share.guest_ok)
+        self.max_connections.set_value(share.max_connections)
+        self.write_list.set_text(" ".join(share.write_list))
+        self.hosts_allow.set_text(" ".join(share.hosts_allow))
+        self.hosts_deny.set_text(" ".join(share.hosts_deny))
+        self.available.set_active(share.available)
 
     def _on_folder_set(self, chooser):
         path = chooser.get_filename() or ""
@@ -178,6 +244,11 @@ class ShareDialog(Gtk.Dialog):
         share.guest_ok = self.guest.get_active()
         share.browseable = self.browseable.get_active()
         share.force_user = self._user if share.guest_ok else ""
+        share.max_connections = int(self.max_connections.get_value())
+        share.write_list = self.write_list.get_text().split()
+        share.hosts_allow = self.hosts_allow.get_text().split()
+        share.hosts_deny = self.hosts_deny.get_text().split()
+        share.available = self.available.get_active()
         return share
 
     def problem(self) -> str | None:
@@ -272,3 +343,89 @@ class PasswordDialog(Gtk.Dialog):
 
     def get_password(self) -> str:
         return self.entry.get_text()
+
+
+class ServerSettingsDialog(Gtk.Dialog):
+    """Settings that apply to the whole server rather than a single share."""
+
+    def __init__(self, parent, settings: ServerSettings):
+        super().__init__(
+            title="Server settings",
+            transient_for=parent,
+            modal=True,
+            use_header_bar=True,
+        )
+        self.set_default_size(540, -1)
+        self.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        save = self.add_button("Save", Gtk.ResponseType.OK)
+        save.get_style_context().add_class("suggested-action")
+        self.set_default_response(Gtk.ResponseType.OK)
+
+        self._settings = settings
+        box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=12, margin=18
+        )
+        box.set_valign(Gtk.Align.START)
+        self.get_content_area().add(box)
+
+        intro = Gtk.Label(xalign=0.0, wrap=True)
+        intro.set_text(
+            "Clients and the server agree on a protocol version before they "
+            "get as far as picking a share, so these limits apply to every "
+            "share at once — Samba has no per share equivalent."
+        )
+        intro.get_style_context().add_class("dim-label")
+        box.add(intro)
+
+        grid = Gtk.Grid(row_spacing=10, column_spacing=12)
+        box.add(grid)
+
+        self.min_protocol = self._protocol_combo(allow_empty=False)
+        grid.attach(_row_label("Oldest allowed"), 0, 0, 1, 1)
+        grid.attach(self.min_protocol, 1, 0, 1, 1)
+
+        self.max_protocol = self._protocol_combo(allow_empty=True)
+        grid.attach(_row_label("Newest allowed"), 0, 1, 1, 1)
+        grid.attach(self.max_protocol, 1, 1, 1, 1)
+
+        self.warning = Gtk.Label(xalign=0.0, wrap=True)
+        box.add(self.warning)
+
+        self._select(self.min_protocol, settings.min_protocol)
+        self._select(self.max_protocol, settings.max_protocol)
+        self.min_protocol.connect("changed", self._on_changed)
+        self.show_all()
+        self._on_changed()
+
+    def _protocol_combo(self, allow_empty: bool) -> Gtk.ComboBoxText:
+        combo = Gtk.ComboBoxText()
+        combo.set_hexpand(True)
+        if allow_empty:
+            combo.append("", "Whatever Samba supports")
+        for name, description in PROTOCOLS:
+            combo.append(name, description)
+        return combo
+
+    @staticmethod
+    def _select(combo: Gtk.ComboBoxText, value: str):
+        if not combo.set_active_id(value or ""):
+            combo.set_active(0)
+
+    def _on_changed(self, _combo=None):
+        if self.min_protocol.get_active_id() == "NT1":
+            self.warning.set_markup(
+                "<b>SMB1 is off by default for good reason.</b> It is the "
+                "protocol WannaCry spread over. Only allow it if a device on "
+                "your network genuinely cannot speak anything newer."
+            )
+            self.warning.show()
+        else:
+            self.warning.set_text("")
+
+    def get_settings(self) -> ServerSettings:
+        self._settings.min_protocol = self.min_protocol.get_active_id() or ""
+        self._settings.max_protocol = self.max_protocol.get_active_id() or ""
+        return self._settings
+
+    def problem(self) -> str | None:
+        return self.get_settings().validate()

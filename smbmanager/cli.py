@@ -15,7 +15,7 @@ import sys
 from . import __version__, shares as shares_mod, system
 
 # Sub commands that keep us out of GTK.  Everything else starts the window.
-CLI_COMMANDS = ("add", "list")
+CLI_COMMANDS = ("add", "list", "server")
 
 _SANITISE_RE = re.compile(r"[^A-Za-z0-9 ._-]+")
 
@@ -24,6 +24,11 @@ Samba exports folders, not single files, so the folder holding the file is
 shared instead:  {folder}
 Everything else in that folder becomes reachable too. The share is read only
 unless you pass --writable."""
+
+
+def _split(value: str) -> list:
+    """Accept both "a,b" and "a b" for list valued options."""
+    return [word for word in re.split(r"[\s,]+", value or "") if word]
 
 
 def fail(message: str) -> int:
@@ -105,11 +110,18 @@ def cmd_add(args) -> int:
         writable=writable,
         guest_ok=args.guest,
         browseable=not args.no_browse,
+        max_connections=args.max_connections,
+        available=not args.disabled,
+        hosts_allow=_split(args.hosts_allow),
+        hosts_deny=_split(args.hosts_deny),
+        write_list=_split(args.write_list),
     )
 
     problem = share.validate()
     if problem:
-        return fail(f"{problem}\nUse --name to pick a different share name.")
+        if share.name_problem():
+            problem += "\nUse --name to pick a different share name."
+        return fail(problem)
 
     existing = shares_mod.load()
     clash = next(
@@ -129,7 +141,10 @@ def cmd_add(args) -> int:
 
     try:
         system.run_privileged(
-            ["apply"], stdin_data=shares_mod.dump(existing + [share])
+            ["apply"],
+            stdin_data=shares_mod.dump(
+                existing + [share], shares_mod.load_settings()
+            ),
         )
     except system.PrivilegedError as exc:
         return fail(str(exc))
@@ -161,6 +176,7 @@ def cmd_add(args) -> int:
 
 
 def cmd_list(args) -> int:
+    settings = shares_mod.load_settings()
     shares = sorted(shares_mod.load(), key=lambda s: s.name.lower())
     if not shares:
         print("No shares are managed by SMB Manager yet.")
@@ -172,6 +188,72 @@ def cmd_list(args) -> int:
     widths = [max(len(row[i]) for row in rows) for i in range(3)]
     for row in rows:
         print("  ".join(row[i].ljust(widths[i]) for i in range(3)) + "  " + row[3])
+    for share in shares:
+        notes = list(extra_notes(share))
+        if notes:
+            print(f"\n{share.name}: " + "; ".join(notes))
+    print(f"\nProtocol: {protocol_range(settings)}")
+    return 0
+
+
+def extra_notes(share):
+    """The advanced options, mentioned only when they are actually set."""
+    if not share.available:
+        yield "disabled"
+    if not share.browseable:
+        yield "hidden from browsing"
+    if share.max_connections:
+        yield f"at most {share.max_connections} connections"
+    if share.write_list:
+        yield "may write: " + ", ".join(share.write_list)
+    if share.hosts_allow:
+        yield "only from " + ", ".join(share.hosts_allow)
+    if share.hosts_deny:
+        yield "never from " + ", ".join(share.hosts_deny)
+
+
+def protocol_range(settings) -> str:
+    newest = settings.max_protocol or "whatever Samba supports"
+    return f"{settings.min_protocol or 'Samba default'} up to {newest}"
+
+
+def cmd_server(args) -> int:
+    settings = shares_mod.load_settings()
+    if args.min_protocol is None and args.max_protocol is None:
+        print(f"Oldest allowed protocol: {settings.min_protocol or '(default)'}")
+        print(f"Newest allowed protocol: {settings.max_protocol or '(default)'}")
+        print()
+        print("Known dialects, oldest first:")
+        for name, description in shares_mod.PROTOCOLS:
+            print(f"    {name:<8} {description}")
+        return 0
+
+    problem = require_samba()
+    if problem:
+        return fail(problem)
+    if args.min_protocol is not None:
+        settings.min_protocol = args.min_protocol
+    if args.max_protocol is not None:
+        settings.max_protocol = args.max_protocol
+    problem = settings.validate()
+    if problem:
+        return fail(problem)
+
+    try:
+        system.run_privileged(
+            ["apply"], stdin_data=shares_mod.dump(shares_mod.load(), settings)
+        )
+    except system.PrivilegedError as exc:
+        return fail(str(exc))
+    print(f"Protocol range: {protocol_range(settings)}")
+    if settings.min_protocol == "NT1":
+        print(
+            "\nWarning: SMB1 is obsolete and insecure. Only allow it for a "
+            "device that genuinely cannot speak anything newer."
+        )
+    if system.service_active():
+        print("Restart Samba for this to affect new connections: "
+              "smbmanager is not restarting it for you.")
     return 0
 
 
@@ -216,12 +298,42 @@ def build_parser() -> argparse.ArgumentParser:
                      help="replace an existing share of the same name")
     add.add_argument("--no-start", action="store_true",
                      help="do not start the Samba service afterwards")
+
+    advanced = add.add_argument_group("advanced")
+    advanced.add_argument("--max-connections", type=int, default=0,
+                          metavar="N",
+                          help="clients allowed at once (0: no limit)")
+    advanced.add_argument("--write-list", default="", metavar="USERS",
+                          help="users who may write even when read only")
+    advanced.add_argument("--hosts-allow", default="", metavar="HOSTS",
+                          help="only these hosts may connect, e.g. "
+                               "192.168.1.0/24")
+    advanced.add_argument("--hosts-deny", default="", metavar="HOSTS",
+                          help="hosts that are always turned away")
+    advanced.add_argument("--disabled", action="store_true",
+                          help="save the share but do not serve it yet")
     add.set_defaults(func=cmd_add)
 
     listing = subparsers.add_parser(
         "list", help="show the shares managed by SMB Manager"
     )
     listing.set_defaults(func=cmd_list)
+
+    server = subparsers.add_parser(
+        "server",
+        help="show or change server wide settings",
+        description="Protocol versions are negotiated before a client picks a "
+                    "share, so Samba only accepts them server wide. Without "
+                    "options this prints the current range.",
+    )
+    server.add_argument("--min-protocol", metavar="DIALECT",
+                        choices=shares_mod.PROTOCOL_NAMES,
+                        help="oldest dialect a client may use")
+    server.add_argument("--max-protocol", metavar="DIALECT",
+                        choices=("",) + shares_mod.PROTOCOL_NAMES,
+                        help="newest dialect a client may use "
+                             "(empty: Samba's own default)")
+    server.set_defaults(func=cmd_server)
 
     return parser
 
